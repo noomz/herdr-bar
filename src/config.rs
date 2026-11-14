@@ -34,6 +34,40 @@ pub struct Config {
     pub follow_new_sessions: bool,
     /// List plugin actions as rows the bar can run.
     pub actions: bool,
+    /// List rows from the other machines saved in Herdr; None when off.
+    pub machines: Option<MachineSources>,
+}
+
+/// Which saved Herdr machines the bar lists rows from, and how long to wait.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MachineSources {
+    /// Machine labels; "*" means every enabled machine.
+    pub include: Vec<String>,
+    pub timeout_ms: u64,
+}
+
+impl MachineSources {
+    pub fn includes(&self, label: &str) -> bool {
+        self.include.iter().any(|entry| entry == "*" || entry == label)
+    }
+
+    /// `{"enabled": true, "include": [...], "timeout_ms": n}`, or None
+    /// unless `enabled` is exactly true.
+    fn from_value(value: Option<&Value>) -> Option<MachineSources> {
+        let Some(Value::Dict(machines)) = value else { return None };
+        if !machines.get("enabled").is_some_and(|v| v.is_true()) {
+            return None;
+        }
+        let include = match machines.get("include") {
+            Some(Value::List(entries)) => entries.iter().filter_map(|v| v.as_str()).map(String::from).collect(),
+            _ => vec!["*".to_string()],
+        };
+        let timeout_ms = match machines.get("timeout_ms") {
+            Some(Value::Int(ms)) if *ms > 0 => (*ms).min(60_000) as u64,
+            _ => 1500,
+        };
+        Some(MachineSources { include, timeout_ms })
+    }
 }
 
 /// Python's `int(value)` for whatever JSON put there; None where it raises.
@@ -107,6 +141,7 @@ impl Config {
             select_current: get("select_current").map(|v| v.is_true()).unwrap_or(false),
             follow_new_sessions: get("follow_new_sessions").map(|v| v.is_true()).unwrap_or(false),
             actions,
+            machines: MachineSources::from_value(get("machines")),
         }
     }
 
@@ -216,6 +251,35 @@ mod tests {
         assert!(with("actions", "true").actions);
         for value in ["false", "\"true\"", "1", "null"] {
             assert!(!with("actions", value).actions, "actions = {}", value);
+        }
+    }
+
+    #[test]
+    fn machines_are_off_unless_enabled() {
+        assert_eq!(Config::default().machines, None);
+        for value in ["null", "true", "{}", r#"{"enabled": false}"#, r#"{"enabled": "true"}"#, r#"{"enabled": 1}"#] {
+            assert_eq!(with("machines", value).machines, None, "machines = {}", value);
+        }
+    }
+
+    #[test]
+    fn machines_default_to_every_machine_within_budget() {
+        let sources = with("machines", r#"{"enabled": true}"#).machines.unwrap();
+        assert_eq!(sources.timeout_ms, 1500);
+        assert!(sources.includes("drm"));
+        assert!(sources.includes("omarchy"));
+    }
+
+    #[test]
+    fn machines_honor_include_and_timeout() {
+        let sources = with("machines", r#"{"enabled": true, "include": ["drm"], "timeout_ms": 250}"#).machines.unwrap();
+        assert_eq!(sources.timeout_ms, 250);
+        assert!(sources.includes("drm"));
+        assert!(!sources.includes("omarchy"));
+        assert!(!with("machines", r#"{"enabled": true, "include": []}"#).machines.unwrap().includes("drm"));
+        for value in ["-5", "0", "\"fast\"", "1.5"] {
+            let text = format!(r#"{{"enabled": true, "timeout_ms": {}}}"#, value);
+            assert_eq!(with("machines", &text).machines.unwrap().timeout_ms, 1500, "timeout_ms = {}", value);
         }
     }
 }
