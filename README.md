@@ -335,6 +335,19 @@ uses. An action gets the same context as from a keybinding: the tab and pane
 you opened the bar from. Running one does not count as a visit, so the bar
 still offers you the place you came from first next time.
 
+**Other machines.** With `"machines": {"enabled": true}`, the bar also lists
+the workspaces, tabs, agents and named panes of the other machines saved in
+Herdr (`herdr machine list`). The local rows show at once; each machine's rows
+join the list when its snapshot arrives, and refresh every few seconds after
+that. A remote row shows its machine's label at the end, and typing the label
+finds that machine's rows. Enter focuses the row on that machine, and the pane
+preview reads from it. Herdr does not let plugins change which machine the
+client shows, so after you focus a remote row, select that machine in Herdr's
+sidebar to see it; a notification reminds you. Remote rows cannot be closed or
+renamed from the bar, show no running time, and do not count as visits. If a
+machine does not answer in time, the footer says `<label> unavailable` once
+and the bar keeps that machine's last rows.
+
 **What a row says.** The tab's own name comes first — that is what you named
 the work and what you remember it by — and an agent's current summary follows it
 in dimmer text. A narrow row keeps the name and drops the summary; a tab with no
@@ -405,6 +418,7 @@ Optional. Write `config.json` in the plugin config directory
 | `scope` | `"all"` | the filter the bar opens with: `"agent"` (`@ agents`), `"pane"` (`% panes`), `"tab"` (`$ shells`), `"blocked"` (`! needs you`), `"action"` (`> actions`, with `"actions": true`) or `"all"`; `backspace` on an empty query still clears it, and `ctrl+u` returns to it |
 | `select_current` | `false` | `true` opens with the row you are in selected instead of the one you came from; the order stays the same, so that row follows the recently visited ones |
 | `actions` | `false` | `true` lists plugin actions as rows that run on Enter; `>` filters to them. The list is read once per open |
+| `machines` | off | `{"enabled": true}` lists rows from the other machines saved in Herdr. `"include"` names the machine labels to show (default `["*"]`, every enabled machine), and `"timeout_ms"` is how long to wait for each machine's answer (default `1500`) |
 | `colors` | `{}` | role → `#rrggbb`, an ANSI name (`bright_blue`), or 0-255. Roles: `accent`, `match`, `text`, `muted`, `blocked`, `working`, `done`, `idle`, `unknown`, plus `agent_claude`, `agent_codex`, `agent_pi`, `agent_grok`, `agent_kimi`, `agent_gemini`, `agent_cursor`, `agent_opencode` |
 
 Colors default to plain ANSI, so the bar follows whatever theme your terminal

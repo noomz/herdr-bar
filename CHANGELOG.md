@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add a `machines` setting that lists rows from the other machines saved in
+  Herdr. Off by default. With `"machines": {"enabled": true}`, each machine's
+  snapshot is read over `herdr --machine <label>` on its own background
+  thread, so the local rows still show at once; `include` picks machine labels
+  (`["*"]` for all) and `timeout_ms` sets each machine's deadline. Remote rows
+  show and match their machine's label, Enter focuses them on that machine and
+  a notification says to select it in the sidebar, the preview reads the pane
+  there, and close and rename refuse them. A machine that does not answer keeps
+  its last rows, and the footer says it is unavailable.
 - Add GitHub Copilot CLI as an `auto_titles` source (#30). Copilot sets its
   terminal title to `<session title> - GitHub Copilot`, so the title is read
   from the snapshot Herdr already reports, with the suffix removed, and no
