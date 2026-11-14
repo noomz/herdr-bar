@@ -291,6 +291,10 @@ pub fn render_row(
     } else if item.kind == KIND_ACTION {
         meta.push(chunk("muted", "action", &field_marks(item, row, "action", 0)));
     }
+    if let Some(machine) = &item.machine {
+        // Last, so a narrow row drops everything else first.
+        meta.push(chunk("accent", machine, &field_marks(item, row, machine, 0)));
+    }
 
     let fixed = plain_width(&leading);
     let available = (width - fixed).max(0);
@@ -847,6 +851,18 @@ mod tests {
             assert_eq!(visible_width(&draw(&theme, &item, &row(&[]), width, false, Some(7440.0))) as isize, width);
         }
         assert!(draw(&theme, &item, &row(&[]), 90, false, Some(7440.0)).contains("2h04m"));
+    }
+
+    #[test]
+    fn a_remote_row_shows_its_machine_and_keeps_its_width() {
+        let theme = theme();
+        let item = items().remove(0).on_machine("omarchy");
+        for width in (20..120).step_by(3) {
+            assert_eq!(visible_width(&draw(&theme, &item, &row(&[]), width, false, None)) as isize, width, "width {}", width);
+        }
+        assert!(strip_ansi(&draw(&theme, &item, &row(&[]), 90, false, None)).contains("omarchy"));
+        let found = matched_row(&item, "omarchy");
+        assert!(strip_ansi(&draw(&theme, &item, &found, 90, false, None)).contains("omarchy"));
     }
 
     #[test]
