@@ -62,6 +62,8 @@ pub struct Item {
     pub detail_field: isize,
     /// The plugin and action ids an action row invokes.
     pub plugin_action: Option<(String, String)>,
+    /// The saved Herdr machine a remote row lives on; None for this one.
+    pub machine: Option<String>,
 }
 
 pub struct ItemInit {
@@ -132,7 +134,24 @@ impl Item {
             prepared,
             detail_field,
             plugin_action: None,
+            machine: None,
         }
+    }
+
+    /// This row as it lives on the saved machine `label`.
+    ///
+    /// Ids like `w1:t4` repeat on every machine, so the key gets the label;
+    /// the label is searchable too, and no remote row is ever this client's
+    /// current one.
+    pub fn on_machine(mut self, label: &str) -> Item {
+        self.key = format!("{}@{}", self.key, label);
+        self.focused = false;
+        if !self.fields.iter().any(|field| pystr::lower(field) == pystr::lower(label)) {
+            self.fields.push(label.to_string());
+            self.prepared.push(Prepared::new(label));
+        }
+        self.machine = Some(label.to_string());
+        self
     }
 
     pub fn status_rank(&self) -> i64 {
@@ -903,5 +922,21 @@ mod tests {
     #[test]
     fn the_platform_is_one_herdr_names() {
         assert!(["linux", "macos", "windows"].contains(&PLATFORM));
+    }
+
+    #[test]
+    fn remote_rows_qualify_their_key_and_search_on_the_label() {
+        let local = items();
+        let remote: Vec<Item> = items().into_iter().map(|item| item.on_machine("drm")).collect();
+        for (local, remote) in local.iter().zip(&remote) {
+            assert_eq!(remote.key, format!("{}@drm", local.key));
+            assert_eq!(remote.machine.as_deref(), Some("drm"));
+            assert_eq!(remote.pane_id, local.pane_id, "ids stay as the machine knows them");
+            assert!(!remote.focused);
+            assert_eq!(remote.fields.last().map(String::as_str), Some("drm"));
+            assert_eq!(remote.fields.len(), remote.prepared.len());
+            assert_eq!(remote.detail_field, local.detail_field);
+        }
+        assert!(local.iter().all(|item| item.machine.is_none()));
     }
 }
