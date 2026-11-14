@@ -8,7 +8,9 @@
 # back to `cargo build --release` (Rust 1.88+) when there is no binary for this machine or
 # the download or the check fails.
 #
-#   HERDR_BAR_BUILD=source     skip the download and build with cargo
+#   HERDR_BAR_BUILD=source     build with cargo (the default in this fork, whose code
+#                              no upstream release binary contains)
+#   HERDR_BAR_BUILD=release    download the release binary as upstream does
 #   HERDR_BAR_DOWNLOAD_BASE=   release download URL to use instead of GitHub's
 #                              (the directory holding the assets)
 set -u
@@ -149,7 +151,7 @@ build_from_source() {
     install_binary "$ROOT/target/release/herdr-bar"
 }
 
-if [ "${HERDR_BAR_BUILD:-}" != source ] && download; then
+if [ "${HERDR_BAR_BUILD:-source}" != source ] && download; then
     say "installed $TARGET"
     exit 0
 fi
