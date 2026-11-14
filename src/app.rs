@@ -8,6 +8,7 @@ use crate::fxhash::FxHashMap;
 use crate::icons;
 use crate::items::{build_action_items, build_items, build_pane_items, Item, KIND_ACTION, KIND_AGENT, KIND_PANE, KIND_SPACE, KIND_TAB, PLATFORM};
 use crate::keys::{Event, KeyDecoder, MouseKind};
+use crate::machines::{Arrival, Machines};
 use crate::mru::Recents;
 use crate::paint::Painter;
 use crate::pystr;
@@ -16,7 +17,7 @@ use crate::render::{self, compute_layout, scrollbar_column, Layout, Row};
 use crate::term::Terminal;
 use crate::textutil::{pad, sanitize};
 use crate::theme::Theme;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -145,10 +146,10 @@ type SortKey = (i64, bool, usize, i64, usize);
 
 /// The rows one snapshot makes, before the bar takes them in.
 pub struct Pool {
-    workspace_count: usize,
+    pub workspace_count: usize,
     /// The tab and agent items, then the pane items.
-    items: Vec<Item>,
-    item_count: usize,
+    pub items: Vec<Item>,
+    pub item_count: usize,
 }
 
 impl Pool {
@@ -168,6 +169,12 @@ impl Pool {
         let item_count = items.len();
         items.extend(build_pane_items(snapshot));
         Pool { workspace_count, items, item_count }
+    }
+
+    /// These rows as they live on the saved machine `label`.
+    pub fn on_machine(self, label: &str) -> Pool {
+        let items = self.items.into_iter().map(|item| item.on_machine(label)).collect();
+        Pool { items, ..self }
     }
 }
 
@@ -209,6 +216,12 @@ pub struct Bar {
     ages: HashMap<String, Option<(f64, f64)>>,
     age_queue: Vec<String>,
     last_refresh: f64,
+    /// Fetches rows from the other saved machines; None unless configured.
+    pub machines: Option<Machines>,
+    /// The last rows each machine gave, kept while it does not answer.
+    remote: BTreeMap<String, Pool>,
+    /// Machines whose last fetch failed, so each failure is told once.
+    unavailable: HashSet<String>,
     dirty: bool,
     list_top: isize,
     list_height: isize,
@@ -253,6 +266,9 @@ impl Bar {
             ages: HashMap::new(),
             age_queue: Vec::new(),
             last_refresh: 0.0,
+            machines: None,
+            remote: BTreeMap::new(),
+            unavailable: HashSet::new(),
             dirty: true,
             list_top: 2,
             list_height: 10,
@@ -330,14 +346,83 @@ impl Bar {
                 break;
             }
         }
-        self.item_count = pool.item_count;
-        let mut items = pool.items;
+        self.place(pool);
+        self.last_refresh = monotonic();
+        self.rebuild(if force { None } else { keep });
+    }
+
+    /// Lay out the pool: local tab and agent rows, then every machine's,
+    /// then local pane rows, then every machine's, then the action rows.
+    fn place(&mut self, local: Pool) {
+        let mut items = local.items;
+        let mut item_count = local.item_count;
+        if !self.remote.is_empty() {
+            let panes = items.split_off(item_count);
+            for remote in self.remote.values() {
+                items.extend(remote.items[..remote.item_count].iter().cloned());
+            }
+            item_count = items.len();
+            items.extend(panes);
+            for remote in self.remote.values() {
+                items.extend(remote.items[remote.item_count..].iter().cloned());
+            }
+        }
+        self.item_count = item_count;
         self.pane_end = items.len();
         items.extend(self.actions.iter().cloned());
         let old = std::mem::replace(&mut self.pool, items);
         crate::par::drop_aside(old, self.pool.len() >= crate::par::MIN_PARALLEL);
-        self.last_refresh = monotonic();
-        self.rebuild(if force { None } else { keep });
+    }
+
+    /// This machine's rows, taken back out of the pool.
+    fn take_local(&mut self) -> Pool {
+        let (item_count, pane_end) = (self.item_count, self.pane_end);
+        let mut items = Vec::new();
+        let mut panes = Vec::new();
+        for (index, item) in std::mem::take(&mut self.pool).into_iter().enumerate() {
+            if item.machine.is_some() || index >= pane_end {
+                continue;
+            }
+            if index < item_count {
+                items.push(item);
+            } else {
+                panes.push(item);
+            }
+        }
+        let item_count = items.len();
+        items.extend(panes);
+        Pool { workspace_count: self.workspace_count, items, item_count }
+    }
+
+    /// Take in what came back from another machine. A machine that fails
+    /// keeps its last rows, and says so once until it answers again.
+    pub fn receive(&mut self, arrival: Arrival) {
+        match arrival {
+            Arrival::Rows(label, Ok(pool)) => {
+                self.unavailable.remove(&label);
+                let keep = if self.rows.is_empty() { None } else { Some(self.selected_item().key.clone()) };
+                self.remote.insert(label, pool);
+                let local = self.take_local();
+                self.place(local);
+                self.rebuild(keep);
+            }
+            Arrival::Rows(label, Err(_)) => {
+                if self.unavailable.insert(label.clone()) {
+                    self.flash(format!("{} unavailable", label));
+                }
+            }
+            Arrival::Preview(key, text) => {
+                self.preview_cache.insert(key, (monotonic(), preview_body(&text)));
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn pump_machines(&mut self) {
+        let Some(machines) = self.machines.as_mut() else { return };
+        for arrival in machines.pump() {
+            self.receive(arrival);
+        }
     }
 
     pub fn rebuild(&mut self, keep_key: Option<String>) {
@@ -393,7 +478,9 @@ impl Bar {
             for &index in chunk {
                 let item = &pool[index];
                 let Some((score, by_field)) = score_item(&terms, item, &mut memo) else { continue };
-                let rank = recents.rank(&item.key, &item.title).unwrap_or(999);
+                // Remote rows stay out of the recents: a title is no key there.
+                let rank = if item.machine.is_some() { None } else { recents.rank(&item.key, &item.title) };
+                let rank = rank.unwrap_or(999);
                 let positions = by_field.get(&0).cloned().unwrap_or_default();
                 // On a tie the place beats the action: Enter should go somewhere.
                 scored.push((
@@ -421,7 +508,8 @@ impl Bar {
                 current = Some(index);
                 continue;
             }
-            match self.recents.rank(&item.key, &item.title) {
+            let rank = if item.machine.is_some() { None } else { self.recents.rank(&item.key, &item.title) };
+            match rank {
                 None => rest.push(index),
                 Some(rank) => recent.push((rank, index)),
             }
@@ -429,14 +517,16 @@ impl Bar {
         recent.sort_by_key(|entry| entry.0);
         rest.sort_by(|&a, &b| {
             let (a, b) = (&self.pool[a], &self.pool[b]);
-            let key = |item: &Item| (item.kind == KIND_ACTION, item.kind == KIND_SPACE, item.status_rank());
+            // Other machines' rows follow this one's, machine by machine.
+            let key = |item: &Item| (item.kind == KIND_ACTION, item.machine.is_some(), item.kind == KIND_SPACE, item.status_rank());
             key(a).cmp(&key(b)).then_with(|| {
                 if a.kind == KIND_ACTION {
                     // Last, in Herdr's order, which keeps each plugin's together.
                     return std::cmp::Ordering::Equal;
                 }
-                a.workspace_label
-                    .cmp(&b.workspace_label)
+                a.machine
+                    .cmp(&b.machine)
+                    .then_with(|| a.workspace_label.cmp(&b.workspace_label))
                     .then_with(|| a.tab_number.unwrap_or(1 << 30).cmp(&b.tab_number.unwrap_or(1 << 30)))
                     .then_with(|| a.title.cmp(&b.title))
             })
@@ -624,6 +714,10 @@ impl Bar {
             return;
         }
         let item = self.selected_item();
+        if let Some(machine) = &item.machine {
+            self.flash(format!("rows on {} cannot be renamed here", machine));
+            return;
+        }
         let tab_id = item.tab_id.clone().filter(|t| !t.is_empty());
         if item.kind == KIND_PANE || item.kind == KIND_SPACE || tab_id.is_none() {
             self.flash("only tabs and agents can be renamed");
@@ -774,13 +868,21 @@ impl Bar {
             return;
         }
         let item = self.selected_item();
+        if let Some(machine) = &item.machine {
+            self.flash(format!("rows on {} cannot be closed here", machine));
+            return;
+        }
         let tab_id = item.tab_id.clone().filter(|t| !t.is_empty());
         if item.kind == KIND_PANE || item.kind == KIND_SPACE || tab_id.is_none() {
             self.flash("only tabs and agents can be closed");
             return;
         }
         let tab_id = tab_id.unwrap();
-        let agents = self.items().iter().filter(|o| o.kind == KIND_AGENT && o.tab_id.as_deref() == Some(tab_id.as_str())).count();
+        let agents = self
+            .items()
+            .iter()
+            .filter(|o| o.kind == KIND_AGENT && o.machine.is_none() && o.tab_id.as_deref() == Some(tab_id.as_str()))
+            .count();
         self.pending_close = Some((tab_id, item.title.clone(), agents));
         self.dirty = true;
     }
@@ -859,6 +961,11 @@ impl Bar {
         if item.kind == KIND_SPACE {
             return (Vec::new(), false);
         }
+        // `pane@label` for a remote pane: the same id is a different pane there.
+        let pane_id = match &item.machine {
+            Some(machine) => format!("{}@{}", pane_id, machine),
+            None => pane_id,
+        };
         let cached = self.preview_cache.get(&pane_id);
         let now = monotonic();
         if let Some((taken, lines)) = cached {
@@ -879,12 +986,15 @@ impl Bar {
             return;
         }
         self.preview_pending = None;
-        let text = self.client.read_pane(&pane_id, height.max(4) as i64, "visible").unwrap_or_default();
-        let mut lines: Vec<String> = pystr::splitlines(&text).iter().map(|line| sanitize(line, " ")).collect();
-        while lines.last().map(|l| pystr::strip(l).is_empty()).unwrap_or(false) {
-            lines.pop();
+        if let Some((pane, machine)) = pane_id.split_once('@') {
+            // Read in the background; `receive` caches it when it arrives.
+            if let Some(machines) = self.machines.as_mut() {
+                machines.read_pane(machine, pane, height.max(4) as i64);
+            }
+            return;
         }
-        self.preview_cache.insert(pane_id, (monotonic(), lines));
+        let text = self.client.read_pane(&pane_id, height.max(4) as i64, "visible").unwrap_or_default();
+        self.preview_cache.insert(pane_id, (monotonic(), preview_body(&text)));
         self.dirty = true;
     }
 
@@ -897,7 +1007,8 @@ impl Bar {
     fn age_of(&mut self, index: usize) -> Option<f64> {
         let item = &self.pool[index];
         let pane_id = item.pane_id.as_deref().filter(|p| !p.is_empty())?;
-        if item.kind == KIND_SPACE || !self.config.running_time {
+        // A remote pane's process is not in this machine's process table.
+        if item.kind == KIND_SPACE || !self.config.running_time || item.machine.is_some() {
             // Disabled: never enqueue, so pump_ages never runs ps/process_info.
             return None;
         }
@@ -1167,6 +1278,7 @@ impl Bar {
             if now - self.last_refresh >= self.config.refresh_ms as f64 / 1000.0 {
                 self.refresh(false);
             }
+            self.pump_machines();
             self.pump_preview(self.list_height);
             self.pump_ages();
             if self.status.as_deref().map(|s| !s.is_empty()).unwrap_or(false) && now >= self.status_until {
@@ -1234,6 +1346,9 @@ impl Bar {
         if let Some((_, due)) = &self.preview_pending {
             deadline = deadline.min(*due);
         }
+        if let Some(machines) = &self.machines {
+            deadline = deadline.min(machines.wake_at());
+        }
         if let Some(escape) = escape_deadline {
             deadline = deadline.min(escape);
         }
@@ -1283,6 +1398,9 @@ pub fn run_action(client: &mut HerdrClient, item: &Item, popup: bool) -> Result<
 
 /// Focus whatever the row points at.
 pub fn jump(client: &mut HerdrClient, item: &Item) -> Result<()> {
+    if let Some(machine) = item.machine.as_deref() {
+        return jump_on_machine(client, item, machine);
+    }
     if item.kind == KIND_SPACE {
         return client.focus_workspace(&item.workspace_id);
     }
@@ -1297,6 +1415,38 @@ pub fn jump(client: &mut HerdrClient, item: &Item) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `jump` for a row on another machine, through `herdr --machine`.
+///
+/// The CLI cannot focus a pane by id, so a pane row lands on its tab, as
+/// without the socket here. Herdr gives plugins no way to switch which
+/// machine the client shows, so a notification says where to look.
+fn jump_on_machine(client: &mut HerdrClient, item: &Item, machine: &str) -> Result<()> {
+    let run = |args: &[&str]| client.cli_on(machine, args).map(|_| ());
+    if item.kind == KIND_SPACE {
+        run(&["workspace", "focus", &item.workspace_id])?;
+    } else {
+        if let Some(tab_id) = item.tab_id.as_deref().filter(|t| !t.is_empty()) {
+            run(&["tab", "focus", tab_id])?;
+        }
+        if let Some(pane_id) = item.pane_id.as_deref().filter(|p| !p.is_empty() && item.kind == KIND_AGENT) {
+            run(&["agent", "focus", pane_id])?;
+        }
+    }
+    let title = format!("Focused on {}", machine);
+    let body = format!("Switch to {} in the Herdr sidebar to see it.", machine);
+    let _ = client.notify(&title, &body);
+    Ok(())
+}
+
+/// A pane's text as preview lines, without its trailing blank ones.
+fn preview_body(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = pystr::splitlines(text).iter().map(|line| sanitize(line, " ")).collect();
+    while lines.last().map(|l| pystr::strip(l).is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -2330,6 +2480,158 @@ mod tests {
         let row = index_of(&t.bar, |i| i.pane_id.as_deref() == Some("w1:p7"));
         let index = t.bar.rows[row].item;
         assert_eq!(jumped(&mut t, index), vec![call(&["tab", "w1:t1"]), call(&["pane", "w1:p7"])]);
+    }
+
+    // -- MachinesTest -----------------------------------------------------------
+
+    #[cfg(unix)]
+    fn remote(label: &str) -> Arrival {
+        Arrival::Rows(label.into(), Ok(Pool::build(&testutil::snapshot(), &Config::default()).on_machine(label)))
+    }
+
+    #[cfg(unix)]
+    fn on(bar: &Bar, label: &str) -> usize {
+        bar.pool.iter().filter(|item| item.machine.as_deref() == Some(label)).count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_rows_join_their_sections_and_survive_a_failure() {
+        let mut t = bar();
+        let (items, panes) = (t.bar.items().len(), t.bar.pane_items().len());
+        t.bar.receive(remote("drm"));
+        assert_eq!(t.bar.items().len(), 2 * items);
+        assert_eq!(t.bar.pane_items().len(), 2 * panes);
+        assert!(t.bar.items()[items..].iter().all(|item| item.machine.as_deref() == Some("drm")));
+        assert!(t.bar.pane_items()[panes..].iter().all(|item| item.machine.as_deref() == Some("drm")));
+        let rows = on(&t.bar, "drm");
+        assert_eq!(rows, items + panes);
+
+        t.bar.receive(Arrival::Rows("drm".into(), Err("timed out".into())));
+        assert_eq!(on(&t.bar, "drm"), rows, "the last good rows stay");
+        assert_eq!(t.bar.status.as_deref(), Some("drm unavailable"));
+        t.bar.status = None;
+        t.bar.receive(Arrival::Rows("drm".into(), Err("timed out".into())));
+        assert_eq!(t.bar.status, None, "told once until it answers again");
+
+        // A local refresh keeps them, and the local rows stay local.
+        t.bar.refresh(true);
+        assert_eq!(on(&t.bar, "drm"), rows);
+        assert_eq!(t.bar.items().iter().filter(|item| item.machine.is_none()).count(), items);
+        assert!(t.bar.current_key.as_deref().is_some_and(|key| !key.contains('@')));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typing_a_machine_label_finds_its_rows() {
+        let mut t = bar();
+        t.bar.receive(remote("drm"));
+        t.bar.receive(remote("omarchy"));
+        t.bar.set_query("omarchy".into(), None);
+        assert!(!t.bar.rows.is_empty());
+        assert!(t.bar.rows.iter().all(|row| t.bar.pool[row.item].machine.as_deref() == Some("omarchy")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_rows_rest_after_this_machines() {
+        let mut t = bar();
+        t.bar.receive(remote("drm"));
+        let machines: Vec<bool> = t.bar.rows.iter().map(|row| t.bar.pool[row.item].machine.is_some()).collect();
+        let first_remote = machines.iter().position(|remote| *remote).unwrap();
+        assert!(machines[first_remote..].iter().all(|remote| *remote));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_rows_refuse_close_and_rename() {
+        let mut t = bar();
+        t.bar.receive(remote("drm"));
+        t.bar.selected = index_of(&t.bar, |item| item.machine.is_some() && item.kind == KIND_AGENT);
+        press(&mut t.bar, &[DELETE]);
+        assert!(t.bar.pending_close.is_none());
+        assert_eq!(t.bar.status.as_deref(), Some("rows on drm cannot be closed here"));
+        press(&mut t.bar, &[b"\x12"]);
+        assert!(t.bar.pending_rename.is_none());
+        assert_eq!(t.bar.status.as_deref(), Some("rows on drm cannot be renamed here"));
+        assert!(t.fake.calls("close").is_empty());
+        assert!(t.fake.calls("rename").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_close_counts_only_local_agents() {
+        let mut t = bar();
+        let before = {
+            press(&mut t.bar, &[DELETE]);
+            t.bar.pending_close.take().unwrap().2
+        };
+        t.bar.receive(remote("drm"));
+        t.bar.selected = 0;
+        press(&mut t.bar, &[DELETE]);
+        assert_eq!(t.bar.pending_close.take().unwrap().2, before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_panes_never_read_or_date_locally() {
+        let mut t = bar();
+        t.bar.receive(remote("drm"));
+        let index = t.bar.pool.iter().position(|item| item.machine.is_some() && item.pane_id.is_some()).unwrap();
+        t.fake.clear_calls();
+        assert_eq!(t.bar.age_of(index), None);
+        let (_, loading) = t.bar.preview_lines(Some(index));
+        assert!(loading);
+        let pending = t.bar.preview_pending.clone().unwrap().0;
+        assert!(pending.ends_with("@drm"));
+        t.bar.preview_pending = Some((pending.clone(), 0.0));
+        t.bar.pump_preview(10);
+        t.bar.pump_ages();
+        assert!(t.fake.all_calls().is_empty(), "{:?}", t.fake.all_calls());
+        // What the machine sends back lands under its own key.
+        t.bar.receive(Arrival::Preview(pending, "remote screen\n\n".into()));
+        assert_eq!(t.bar.preview_lines(Some(index)), (vec!["remote screen".to_string()], false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_jump_runs_on_that_machine_and_says_where_to_look() {
+        let mut t = bar();
+        t.bar.receive(remote("drm"));
+        let dir = testutil::TempDir::new();
+        let log = dir.path().join("calls");
+        let script = dir.path().join("herdr");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{{\"result\":{{}}}}\\n'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        t.bar.client.bin_path = script.to_string_lossy().into_owned();
+        let agent = t.bar.pool.iter().find(|item| item.machine.is_some() && item.kind == KIND_AGENT).unwrap().clone();
+        let space = t.bar.pool.iter().find(|item| item.machine.is_some() && item.kind == KIND_SPACE).unwrap().clone();
+        t.fake.clear_calls();
+        jump(&mut t.bar.client, &agent).unwrap();
+        jump(&mut t.bar.client, &space).unwrap();
+        assert!(t.fake.all_calls().is_empty(), "nothing goes to this machine's server");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let notify = "notification show Focused on drm --body Switch to drm in the Herdr sidebar to see it.";
+        let expected = vec![
+            format!("--machine drm tab focus {}", agent.tab_id.as_deref().unwrap()),
+            format!("--machine drm agent focus {}", agent.pane_id.as_deref().unwrap()),
+            notify.to_string(),
+            format!("--machine drm workspace focus {}", space.workspace_id),
+            notify.to_string(),
+        ];
+        assert_eq!(calls.lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_machines_nothing_changes() {
+        let t = bar();
+        assert!(t.bar.machines.is_none());
+        assert!(t.bar.pool.iter().all(|item| item.machine.is_none()));
     }
 
     // -- CloseTest --------------------------------------------------------------

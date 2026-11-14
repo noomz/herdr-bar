@@ -12,6 +12,7 @@ mod host;
 mod icons;
 mod items;
 mod keys;
+mod machines;
 mod mru;
 mod opener;
 mod paint;

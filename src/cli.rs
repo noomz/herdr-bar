@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::host;
 use crate::icons;
 use crate::items::{build_items, KIND_ACTION};
+use crate::machines::Machines;
 use crate::mru::Recents;
 use crate::opener::open_bar;
 use crate::pyjson::{self, Map, Value};
@@ -228,6 +229,8 @@ pub fn main(args: Vec<String>) -> i32 {
         icons::prefetch();
     }
     let fetch_config = config.clone();
+    // Other machines answer over SSH: started now, merged as they arrive.
+    let machines = Machines::start(&config);
     // The plugin actions, when asked for, are a third read of their own.
     let actions = config.actions.then(|| {
         let mut client = client.clone();
@@ -266,6 +269,7 @@ pub fn main(args: Vec<String>) -> i32 {
     // rows one by one would only delay the exit (Bar owns nothing to flush).
     let mut bar = std::mem::ManuallyDrop::new(Bar::new(client, config, Recents::new(None), theme));
     std::mem::swap(&mut bar.recents, &mut recents);
+    bar.machines = machines;
     if let Some(actions) = actions {
         bar.actions = actions.join().unwrap_or_default();
     }
@@ -292,6 +296,10 @@ pub fn main(args: Vec<String>) -> i32 {
     }
     if let Err(error) = jump(&mut bar.client, &item) {
         return fail(&error.message);
+    }
+    if item.machine.is_some() {
+        // This client still shows this machine, so nothing here moved.
+        return 0;
     }
     let current_key = bar.current_key.clone();
     let current_title = bar.current_title.clone();

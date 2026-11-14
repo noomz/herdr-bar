@@ -242,7 +242,7 @@ impl HerdrClient {
         HerdrClient::snapshot_of(result)
     }
 
-    fn snapshot_of(mut result: Map) -> Result<Value> {
+    pub fn snapshot_of(mut result: Map) -> Result<Value> {
         match result.remove("snapshot") {
             Some(snapshot @ Value::Dict(_)) => Ok(snapshot),
             _ => Err(HerdrError::new("session snapshot missing from response")),
@@ -282,6 +282,16 @@ impl HerdrClient {
         }
         previous.clear();
         self.snapshot().map(Some)
+    }
+
+    /// A CLI request run on the saved machine `label`.
+    pub fn cli_on(&self, label: &str, args: &[&str]) -> Result<Map> {
+        HerdrClient::unwrap(self.cli(&crate::machines::on_machine(label, args))?)
+    }
+
+    pub fn notify(&self, title: &str, body: &str) -> Result<Map> {
+        let args: Vec<String> = ["notification", "show", title, "--body", body].iter().map(|s| s.to_string()).collect();
+        HerdrClient::unwrap(self.cli(&args)?)
     }
 
     pub fn read_pane(&mut self, pane_id: &str, lines: i64, source: &str) -> Result<String> {
