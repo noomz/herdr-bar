@@ -100,6 +100,14 @@ pub fn dict(entries: &[(&str, Value)]) -> Value {
     Value::Dict(map)
 }
 
+/// What `machine.show` focuses on the machine it switches to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowTarget<'a> {
+    Workspace(&'a str),
+    Tab(&'a str),
+    Pane(&'a str),
+}
+
 #[derive(Clone)]
 pub struct HerdrClient {
     pub socket_path: Option<String>,
@@ -287,6 +295,17 @@ impl HerdrClient {
     /// A CLI request run on the saved machine `label`.
     pub fn cli_on(&self, label: &str, args: &[&str]) -> Result<Map> {
         HerdrClient::unwrap(self.cli(&crate::machines::on_machine(label, args))?)
+    }
+
+    /// Ask the attached client to show `label` and focus `target` there.
+    pub fn show_machine(&mut self, label: &str, target: ShowTarget) -> Result<()> {
+        let (key, flag, id) = match target {
+            ShowTarget::Workspace(id) => ("workspace_id", "--workspace", id),
+            ShowTarget::Tab(id) => ("tab_id", "--tab", id),
+            ShowTarget::Pane(id) => ("pane_id", "--pane", id),
+        };
+        let params = dict(&[("machine", Value::str(label)), (key, Value::str(id))]);
+        self.call("machine.show", params, &["machine", "show", label, flag, id]).map(|_| ())
     }
 
     pub fn notify(&self, title: &str, body: &str) -> Result<Map> {

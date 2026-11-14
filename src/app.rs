@@ -1,7 +1,7 @@
 //! The bar itself: state, key handling, and the draw loop.
 
 use crate::age::{elapsed_seconds_many, pid_for};
-use crate::client::{HerdrClient, Result};
+use crate::client::{HerdrClient, Result, ShowTarget};
 use crate::config::Config;
 use crate::fuzzy::{match_prepared, split_query, Match, Term};
 use crate::fxhash::FxHashMap;
@@ -1417,12 +1417,25 @@ pub fn jump(client: &mut HerdrClient, item: &Item) -> Result<()> {
     Ok(())
 }
 
-/// `jump` for a row on another machine, through `herdr --machine`.
+/// `jump` for a row on another machine.
 ///
-/// The CLI cannot focus a pane by id, so a pane row lands on its tab, as
-/// without the socket here. Herdr gives plugins no way to switch which
-/// machine the client shows, so a notification says where to look.
+/// A Herdr with `machine.show` switches the client to that machine and
+/// focuses the row there. Older Herdr servers and clients lack it, so the row
+/// is focused through `herdr --machine` and a notification says where to look.
+/// That CLI cannot focus a pane by id, so a pane row lands on its tab.
 fn jump_on_machine(client: &mut HerdrClient, item: &Item, machine: &str) -> Result<()> {
+    let pane = item.pane_id.as_deref().filter(|p| !p.is_empty() && (item.kind == KIND_AGENT || item.kind == KIND_PANE));
+    let tab = item.tab_id.as_deref().filter(|t| !t.is_empty());
+    let target = if item.kind == KIND_SPACE {
+        Some(ShowTarget::Workspace(&item.workspace_id))
+    } else {
+        pane.map(ShowTarget::Pane).or(tab.map(ShowTarget::Tab))
+    };
+    if let Some(target) = target {
+        if client.show_machine(machine, target).is_ok() {
+            return Ok(());
+        }
+    }
     let run = |args: &[&str]| client.cli_on(machine, args).map(|_| ());
     if item.kind == KIND_SPACE {
         run(&["workspace", "focus", &item.workspace_id])?;
