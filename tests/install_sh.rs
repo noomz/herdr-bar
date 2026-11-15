@@ -120,6 +120,7 @@ impl Setup {
             .env("PATH", &self.path_dir)
             .env("HOME", &self.tmp)
             .env("TMPDIR", &self.tmp)
+            .env("HERDR_BAR_BUILD", "release")
             .env("HERDR_BAR_DOWNLOAD_BASE", base)
             .stdin(Stdio::null())
             .output()

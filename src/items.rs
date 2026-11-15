@@ -64,6 +64,9 @@ pub struct Item {
     pub plugin_action: Option<(String, String)>,
     /// The saved Herdr machine a remote row lives on; None for this one.
     pub machine: Option<String>,
+    /// That machine's server boot id, which every client knows it by,
+    /// whatever label each server saved it under.
+    pub machine_boot_id: Option<String>,
 }
 
 pub struct ItemInit {
@@ -135,6 +138,7 @@ impl Item {
             detail_field,
             plugin_action: None,
             machine: None,
+            machine_boot_id: None,
         }
     }
 

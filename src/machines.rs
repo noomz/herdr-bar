@@ -161,7 +161,8 @@ fn pool_of(label: &str, answer: &str, config: &Config) -> std::result::Result<Po
     let lines = pystr::splitlines(pystr::strip(answer));
     let response = pyjson::loads(lines.last().copied().unwrap_or("")).map_err(|_| "unreadable snapshot".to_string())?;
     let snapshot = HerdrClient::unwrap(response).and_then(HerdrClient::snapshot_of).map_err(|error| error.message)?;
-    Ok(Pool::build(&snapshot, config).on_machine(label))
+    let boot_id = snapshot.get("boot_id").as_str().filter(|id| !id.is_empty());
+    Ok(Pool::build(&snapshot, config).on_machine(label, boot_id))
 }
 
 /// Run the Herdr CLI with a deadline: its stdout, or why it failed.

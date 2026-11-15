@@ -171,9 +171,14 @@ impl Pool {
         Pool { workspace_count, items, item_count }
     }
 
-    /// These rows as they live on the saved machine `label`.
-    pub fn on_machine(self, label: &str) -> Pool {
-        let items = self.items.into_iter().map(|item| item.on_machine(label)).collect();
+    /// These rows as they live on the saved machine `label`, whose server
+    /// boot id is `boot_id`.
+    pub fn on_machine(self, label: &str, boot_id: Option<&str>) -> Pool {
+        let items = self
+            .items
+            .into_iter()
+            .map(|item| Item { machine_boot_id: boot_id.map(str::to_string), ..item.on_machine(label) })
+            .collect();
         Pool { items, ..self }
     }
 }
@@ -1432,7 +1437,7 @@ fn jump_on_machine(client: &mut HerdrClient, item: &Item, machine: &str) -> Resu
         pane.map(ShowTarget::Pane).or(tab.map(ShowTarget::Tab))
     };
     if let Some(target) = target {
-        if client.show_machine(machine, target).is_ok() {
+        if client.show_machine(machine, item.machine_boot_id.as_deref(), target).is_ok() {
             return Ok(());
         }
     }
@@ -1591,6 +1596,8 @@ mod tests {
         /// Panes the fake can date (it reports this test process for them).
         ages: Value,
         age_error: bool,
+        /// Whether the fake answers `machine.show`, as a Herdr with it does.
+        machine_show: bool,
     }
 
     #[cfg(unix)]
@@ -1701,6 +1708,10 @@ mod tests {
                 }
             }
             "popup.close" => state.calls.push(vec!["popup".into()]),
+            "machine.show" if state.machine_show => {
+                let target = ["workspace_id", "tab_id", "pane_id"].iter().find(|key| !s(&params, key).is_empty()).unwrap();
+                state.calls.push(vec!["show".into(), s(&params, "machine"), s(&params, "boot_id"), s(&params, target)]);
+            }
             _ => return err("unknown method"),
         }
         ok(result)
@@ -1720,6 +1731,7 @@ mod tests {
                 rename_error: None,
                 ages: testutil::pane_ages(),
                 age_error: false,
+                machine_show: false,
             }));
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (shared, halt) = (state.clone(), stop.clone());
@@ -2499,7 +2511,7 @@ mod tests {
 
     #[cfg(unix)]
     fn remote(label: &str) -> Arrival {
-        Arrival::Rows(label.into(), Ok(Pool::build(&testutil::snapshot(), &Config::default()).on_machine(label)))
+        Arrival::Rows(label.into(), Ok(Pool::build(&testutil::snapshot(), &Config::default()).on_machine(label, Some("boot-remote"))))
     }
 
     #[cfg(unix)]
@@ -2637,6 +2649,31 @@ mod tests {
             notify.to_string(),
         ];
         assert_eq!(calls.lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_jump_asks_the_client_to_show_that_machine_by_boot_id() {
+        let mut t = bar();
+        t.bar.receive(remote("drm"));
+        t.fake.set(|s| s.machine_show = true);
+        let dir = testutil::TempDir::new();
+        let log = dir.path().join("calls");
+        let script = dir.path().join("herdr");
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display())).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        t.bar.client.bin_path = script.to_string_lossy().into_owned();
+        let agent = t.bar.pool.iter().find(|item| item.machine.is_some() && item.kind == KIND_AGENT).unwrap().clone();
+        let space = t.bar.pool.iter().find(|item| item.machine.is_some() && item.kind == KIND_SPACE).unwrap().clone();
+        t.fake.clear_calls();
+        jump(&mut t.bar.client, &agent).unwrap();
+        jump(&mut t.bar.client, &space).unwrap();
+        let show = |id: &str| vec!["show".to_string(), "drm".into(), "boot-remote".into(), id.to_string()];
+        assert_eq!(
+            t.fake.all_calls(),
+            vec![show(agent.pane_id.as_deref().unwrap()), show(&space.workspace_id)]
+        );
+        assert!(!log.exists(), "nothing runs through herdr --machine");
     }
 
     #[cfg(unix)]

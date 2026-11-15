@@ -298,14 +298,23 @@ impl HerdrClient {
     }
 
     /// Ask the attached client to show `label` and focus `target` there.
-    pub fn show_machine(&mut self, label: &str, target: ShowTarget) -> Result<()> {
+    ///
+    /// `boot_id` names the machine's server the same way on every client, so
+    /// the client finds it even when it saved that machine under another label
+    /// (or is that machine).
+    pub fn show_machine(&mut self, label: &str, boot_id: Option<&str>, target: ShowTarget) -> Result<()> {
         let (key, flag, id) = match target {
             ShowTarget::Workspace(id) => ("workspace_id", "--workspace", id),
             ShowTarget::Tab(id) => ("tab_id", "--tab", id),
             ShowTarget::Pane(id) => ("pane_id", "--pane", id),
         };
-        let params = dict(&[("machine", Value::str(label)), (key, Value::str(id))]);
-        self.call("machine.show", params, &["machine", "show", label, flag, id]).map(|_| ())
+        let mut entries = vec![("machine", Value::str(label)), (key, Value::str(id))];
+        let mut args = vec!["machine", "show", label, flag, id];
+        if let Some(boot_id) = boot_id {
+            entries.push(("boot_id", Value::str(boot_id)));
+            args.extend(["--boot-id", boot_id]);
+        }
+        self.call("machine.show", dict(&entries), &args).map(|_| ())
     }
 
     pub fn notify(&self, title: &str, body: &str) -> Result<Map> {
